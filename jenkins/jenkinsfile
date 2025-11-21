@@ -1,0 +1,117 @@
+/**
+ * Pipeline Jenkins pour l'application Flask
+ *
+ * Ce pipeline automatise les étapes suivantes :
+ * 1. Build de l'image Docker de l'application Flask.
+ * 2. Création du cluster Kind si celui-ci n'existe pas.
+ * 3. Chargement de l'image Docker dans le cluster Kind.
+ * 4. Déploiement de l'application (Deployment et Service) dans Kubernetes.
+ */
+
+// Définition des variables globales
+def IMAGE_NAME = 'flask-app'
+def K8S_DEPLOYMENT_NAME = 'flask-app-deployment'
+def K8S_SERVICE_NAME = 'flask-app-service'
+def KIND_CLUSTER_NAME = 'local-dev-cluster'
+def TAG = env.BUILD_NUMBER ?: 'latest'
+
+pipeline {
+    agent any
+
+    stages {
+        // Étape 1: Construction et Tagging de l'image Docker
+        stage('Build & Tag Docker Image') {
+            steps {
+                script {
+                    echo "🔨 Construction de l'image: ${IMAGE_NAME}:${TAG}"
+                    // Construit l'image Docker en utilisant le Dockerfile à la racine
+                    sh "docker build -t ${IMAGE_NAME}:${TAG} ."
+                    
+                    // Tag l'image avec un tag 'latest' pour la rendre plus facile à référencer
+                    sh "docker tag ${IMAGE_NAME}:${TAG} ${IMAGE_NAME}:latest"
+                }
+            }
+        }
+
+        // Étape 2: Vérification et Création du Cluster Kind
+        stage('Setup Kind Cluster') {
+            steps {
+                script {
+                    // Vérifie si le cluster Kind existe
+                    def clusterExists = sh(
+                        script: "kind get clusters | grep -w ${KIND_CLUSTER_NAME}",
+                        returnStatus: true
+                    )
+
+                    if (clusterExists != 0) {
+                        echo "Cluster Kind '${KIND_CLUSTER_NAME}' non trouvé. Création en cours..."
+                        // Crée un nouveau cluster Kind
+                        sh "kind create cluster --name ${KIND_CLUSTER_NAME}"
+                    } else {
+                        echo "Cluster Kind '${KIND_CLUSTER_NAME}' existe déjà. Poursuite..."
+                    }
+                    
+                    // S'assure que kubectl pointe vers le bon cluster
+                    sh "kubectl cluster-info --context kind-${KIND_CLUSTER_NAME}"
+                }
+            }
+        }
+
+        // Étape 3: Chargement de l'image dans le Cluster Kind
+        stage('Load Image into Kind') {
+            steps {
+                script {
+                    echo "📦 Chargement de l'image Docker dans le cluster Kind..."
+                    // Kind ne peut pas accéder aux images Docker locales directement, elles doivent être chargées
+                    // Nous chargeons le tag 'latest' pour correspondre au manifeste K8s
+                    sh "kind load docker-image ${IMAGE_NAME}:latest --name ${KIND_CLUSTER_NAME}"
+                }
+            }
+        }
+
+        // Étape 4: Déploiement dans Kubernetes
+        stage('Deploy to Kind') {
+            steps {
+                script {
+                    echo "🚀 Déploiement des manifestes Kubernetes (k8s/*.yaml)..."
+                    // Applique les manifestes dans le répertoire k8s
+                    sh "kubectl apply -f k8s/"
+                    
+                    // Attend que le déploiement soit prêt
+                    sh "kubectl rollout status deployment/${K8S_DEPLOYMENT_NAME}"
+                }
+            }
+        }
+
+        // Étape 5: Affichage des informations d'accès
+        stage('Show Access Info') {
+            steps {
+                script {
+                    echo "✅ Déploiement terminé. Informations d'accès au service:"
+                    // Récupère le NodePort assigné dynamiquement
+                    def nodePort = sh(
+                        script: "kubectl get service ${K8S_SERVICE_NAME} -o jsonpath='{.spec.ports[0].nodePort}'",
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Récupère l'adresse IP du nœud Kind (utile si vous utilisez un autre outil pour l'IP)
+                    def nodeIP = sh(
+                        script: "docker inspect -f '{{.NetworkSettings.IPAddress}}' ${KIND_CLUSTER_NAME}-control-plane",
+                        returnStdout: true,
+                        // Ajoute ce bloc pour que le script ne fasse pas planter le pipeline s'il ne trouve pas l'IP
+                        // dans le cas de setup plus complexes, mais pour Kind par défaut l'IP est l'IP du conteneur.
+                        // Cependant, l'accès se fait plus simplement via 127.0.0.1 ou localhost pour Kind.
+                        // Nous utiliserons la méthode recommandée pour Kind.
+                        
+                    ).trim()
+
+                    echo "\n-----------------------------------------------------"
+                    echo "Application: http://localhost:${nodePort}"
+                    echo "Metrics:     http://localhost:${nodePort}/metrics"
+                    echo "Note: Kind expose les NodePorts via l'adresse localhost/127.0.0.1"
+                    echo "-----------------------------------------------------\n"
+                }
+            }
+        }
+    }
+}
